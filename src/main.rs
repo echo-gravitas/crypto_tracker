@@ -332,11 +332,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let trade_url = format!("https://www.binance.com/de/trade/{}_USDT", base);
                 let pair = format!("{}/USDT", base);
                 let changes = change_parts.join(" > ");
+                let config_info = format!(
+                    "Intervall: {}s | Kerze: {}",
+                    config.interval_secs, config.candle_interval
+                );
                 let message = format!(
-                    "{}\n*{}* \\- {}\n[{}]({})",
+                    "{}\n*{}* \\- {}\n{}\n[{}]({})",
                     escape_markdown_v2(&request_ts),
                     escape_markdown_v2(&pair),
                     escape_markdown_v2(&changes),
+                    escape_markdown_v2(&config_info),
                     escape_markdown_v2("Trade"),
                     escape_markdown_url(&trade_url)
                 );
