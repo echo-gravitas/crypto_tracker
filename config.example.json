@@ -1,0 +1,9 @@
+{
+  "interval_secs": 60,
+  "change_threshold_pct": 0.5,
+  "candle_interval": "1m",
+  "streak_len": 5,
+  "close_delay_secs": 0,
+  "telegram_token": "YOUR_BOT_TOKEN",
+  "telegram_chat_id": "YOUR_CHAT_ID"
+}

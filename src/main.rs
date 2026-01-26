@@ -22,6 +22,7 @@ struct Config {
     change_threshold_pct: f64,
     candle_interval: String,
     streak_len: usize,
+    close_delay_secs: u64,
     telegram_token: String,
     telegram_chat_id: String,
 }
@@ -33,6 +34,7 @@ impl Default for Config {
             change_threshold_pct: 0.5,
             candle_interval: "1m".to_string(),
             streak_len: 5,
+            close_delay_secs: 0,
             telegram_token: String::new(),
             telegram_chat_id: String::new(),
         }
@@ -103,6 +105,10 @@ fn parse_config() -> Result<(Config, bool), Box<dyn std::error::Error>> {
                 let value = args.next().ok_or("missing value for --streak-len")?;
                 config.streak_len = value.parse()?;
             }
+            "--close-delay-secs" => {
+                let value = args.next().ok_or("missing value for --close-delay-secs")?;
+                config.close_delay_secs = value.parse()?;
+            }
             "--telegram-token" => {
                 let value = args.next().ok_or("missing value for --telegram-token")?;
                 config.telegram_token = value;
@@ -116,10 +122,10 @@ fn parse_config() -> Result<(Config, bool), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: crypto_tracker [--interval-secs N] [--change-pct P] [--candle-interval I] [--streak-len N] [--telegram-token T] [--telegram-chat-id ID] [--save-config]"
+                    "Usage: crypto_tracker [--interval-secs N] [--change-pct P] [--candle-interval I] [--streak-len N] [--close-delay-secs N] [--telegram-token T] [--telegram-chat-id ID] [--save-config]"
                 );
                 println!(
-                    "Defaults: --interval-secs 30, --change-pct 1.0, --candle-interval 1m, --streak-len 3"
+                    "Defaults: --interval-secs 60, --change-pct 0.5, --candle-interval 1m, --streak-len 5, --close-delay-secs 0"
                 );
                 println!("Telegram: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID or pass flags.");
                 println!("Config: saved/loaded from ~/.crypto_tracker/config.json");
@@ -240,6 +246,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         sleep_until_interval_boundary(config.interval_secs);
+        if config.close_delay_secs > 0 {
+            std::thread::sleep(Duration::from_secs(config.close_delay_secs));
+        }
         let request_time = Local::now();
         let request_ts = format_timestamp_de(request_time);
         let now_ms = SystemTime::now()
@@ -333,11 +342,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pair = format!("{}/USDT", base);
                 let changes = change_parts.join(" > ");
                 let config_info = format!(
-                    "Intervall: {}s | Kerze: {}",
-                    config.interval_secs, config.candle_interval
+                    "Interval: {}s\nThreshold: {:.2}%\nCandle Length: {}",
+                    config.interval_secs, config.change_threshold_pct, config.candle_interval
                 );
                 let message = format!(
-                    "{}\n*{}* \\- {}\n{}\n[{}]({})",
+                    "{}\n\n*{}*\n{}\n\n{}\n[{}]({})",
                     escape_markdown_v2(&request_ts),
                     escape_markdown_v2(&pair),
                     escape_markdown_v2(&changes),
