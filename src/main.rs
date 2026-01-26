@@ -182,6 +182,10 @@ fn format_timestamp_de(time: DateTime<Local>) -> String {
     )
 }
 
+fn format_timestamp_short(time: DateTime<Local>) -> String {
+    time.format("%d.%m.%Y %H:%M").to_string()
+}
+
 fn send_telegram_message(
     client: &reqwest::blocking::Client,
     token: &str,
@@ -251,6 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let request_time = Local::now();
         let request_ts = format_timestamp_de(request_time);
+        println!("{}: API requested", format_timestamp_short(request_time));
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
