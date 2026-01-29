@@ -4,6 +4,7 @@
   "candle_interval": "1m",
   "streak_len": 5,
   "close_delay_secs": 0,
+  "min_quote_volume_24h": 100000000,
   "telegram_token": "YOUR_BOT_TOKEN",
   "telegram_chat_id": "YOUR_CHAT_ID"
 }
