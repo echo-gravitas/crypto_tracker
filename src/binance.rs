@@ -1,6 +1,9 @@
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::TcpStream;
+use std::time::Duration;
+use tungstenite::{Message, WebSocket, connect};
 
 #[derive(Deserialize)]
 pub struct ExchangeInfo {
@@ -65,4 +68,59 @@ pub fn fetch_klines(
         .error_for_status()?;
     let klines: Vec<Vec<serde_json::Value>> = response.json()?;
     Ok(klines)
+}
+
+#[derive(Deserialize)]
+pub struct WsKlineEvent {
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "k")]
+    pub kline: WsKline,
+}
+
+#[derive(Deserialize)]
+pub struct WsKline {
+    #[serde(rename = "x")]
+    pub is_closed: bool,
+    #[serde(rename = "c")]
+    pub close: String,
+}
+
+#[derive(Deserialize)]
+pub struct WsSubscriptionAck {
+    pub id: Option<u64>,
+}
+
+pub fn connect_kline_stream(
+    symbols: &[String],
+    interval: &str,
+) -> Result<WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error>> {
+    let (mut socket, _) = connect("wss://stream.binance.com:9443/ws")?;
+    let params: Vec<String> = symbols
+        .iter()
+        .map(|symbol| format!("{}@kline_{}", symbol.to_lowercase(), interval))
+        .collect();
+    let subscribe = serde_json::json!({
+        "method": "SUBSCRIBE",
+        "params": params,
+        "id": 1
+    });
+    socket.send(Message::Text(subscribe.to_string()))?;
+    Ok(socket)
+}
+
+pub fn set_socket_read_timeout(
+    socket: &mut WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => {
+            stream.set_read_timeout(Some(timeout))?;
+        }
+        tungstenite::stream::MaybeTlsStream::NativeTls(stream) => {
+            stream.get_mut().set_read_timeout(Some(timeout))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
