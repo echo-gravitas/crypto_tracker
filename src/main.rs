@@ -10,6 +10,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use telegram::{escape_markdown_v2, send_telegram_message};
 use time_utils::{format_timestamp_de, format_timestamp_short, sleep_until_interval_boundary};
 
+fn candle_interval_secs(interval: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    if interval.len() < 2 {
+        return Err(format!("invalid candle interval: {}", interval).into());
+    }
+
+    let (value, unit) = interval.split_at(interval.len() - 1);
+    let value: u64 = value.parse()?;
+    let seconds = match unit {
+        "s" => value,
+        "m" => value * 60,
+        "h" => value * 60 * 60,
+        "d" => value * 60 * 60 * 24,
+        "w" => value * 60 * 60 * 24 * 7,
+        _ => return Err(format!("unsupported candle interval: {}", interval).into()),
+    };
+    Ok(seconds)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut config, save_config) = parse_config()?;
     if save_config {
@@ -36,10 +54,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{}: Exchange Info Requested",
             format_timestamp_short(request_time)
         );
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_millis() as i64;
         let info = fetch_exchange_info(&client)?;
         println!(
             "{}: 24h Volume for all symbols requested",
@@ -74,6 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if config.streak_len == 0 {
             return Err("--streak-len must be at least 1".into());
         }
+        let candle_secs = candle_interval_secs(&config.candle_interval)?;
+        let lookback_candles = config.interval_secs.div_ceil(candle_secs) as usize;
+        let required_closed_klines = lookback_candles.max(config.streak_len) + 1;
 
         for symbol in symbols {
             println!(
@@ -86,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format_timestamp_short(Local::now()),
                 symbol
             );
-            let limit = config.streak_len + 2;
+            let limit = required_closed_klines + 1;
             let klines = fetch_klines(
                 &client,
                 symbol.as_str(),
@@ -97,6 +114,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_millis() as i64;
             let mut closes: Vec<f64> = Vec::with_capacity(klines.len());
             for kline in &klines {
                 let close_time_ms = match kline.get(6) {
@@ -116,30 +137,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(close) = close else { continue };
                 closes.push(close);
             }
-            if closes.len() < config.streak_len + 1 {
+            if closes.len() < required_closed_klines {
+                println!(
+                    "{}: {} insufficient closed klines (have {}, need {})",
+                    format_timestamp_short(Local::now()),
+                    symbol,
+                    closes.len(),
+                    required_closed_klines
+                );
                 continue;
             }
-            let start = closes.len() - (config.streak_len + 1);
+            let start = closes.len() - required_closed_klines;
             let closes = &closes[start..];
+            let close_debug: Vec<String> = closes.iter().map(|v| format!("{:.8}", v)).collect();
+            println!(
+                "{}: {} klines(closes) [{}]",
+                format_timestamp_short(Local::now()),
+                symbol,
+                close_debug.join(", ")
+            );
 
-            let mut streak_ok = true;
-            let mut change_parts: Vec<String> = Vec::with_capacity(config.streak_len);
-            for window in closes.windows(2) {
-                let prev = window[0];
-                let last = window[1];
-                if prev <= 0.0 {
-                    streak_ok = false;
+            let mut matched_changes: Option<Vec<String>> = None;
+            for change_window in closes.windows(config.streak_len + 1) {
+                let mut change_parts: Vec<String> = Vec::with_capacity(config.streak_len);
+                let mut window_ok = true;
+
+                for pair in change_window.windows(2) {
+                    let prev = pair[0];
+                    let last = pair[1];
+                    if prev <= 0.0 {
+                        window_ok = false;
+                        break;
+                    }
+                    let change_pct = (last - prev) / prev * 100.0;
+                    if change_pct < config.change_threshold_pct {
+                        window_ok = false;
+                        break;
+                    }
+                    change_parts.push(format!("{:.2}%", change_pct));
+                }
+
+                if window_ok {
+                    matched_changes = Some(change_parts);
                     break;
                 }
-                let change_pct = (last - prev) / prev * 100.0;
-                if change_pct < config.change_threshold_pct {
-                    streak_ok = false;
-                    break;
-                }
-                change_parts.push(format!("{:.2}%", change_pct));
             }
 
-            if streak_ok {
+            if let Some(change_parts) = matched_changes {
                 let base = symbol.strip_suffix("USDT").unwrap_or(&symbol);
                 let trade_url = format!("https://www.binance.com/de/trade/{}_USDT", base);
                 let pair = format!("{}/USDT", base);
