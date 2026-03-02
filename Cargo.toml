@@ -1,6 +1,6 @@
 [package]
 name = "crypto_tracker"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 
 [dependencies]
@@ -8,3 +8,4 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
+tungstenite = { version = "0.24", features = ["native-tls"] }
