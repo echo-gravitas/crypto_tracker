@@ -84,7 +84,13 @@ fn fetch_trading_usdt_symbols(
         .collect();
 
     tradable.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-    Ok(tradable.into_iter().map(|s| s.symbol.clone()).collect())
+    let symbols: Vec<String> = tradable.into_iter().map(|s| s.symbol.clone()).collect();
+    println!(
+        "{}: Fetched {} TRADING USDT symbols from exchangeInfo",
+        format_timestamp_short(Local::now()),
+        symbols.len()
+    );
+    Ok(symbols)
 }
 
 fn load_symbol_universe(
@@ -323,11 +329,20 @@ fn register_new_listings(
     known_trading_symbols: &mut HashSet<String>,
     fresh_listings: &mut HashMap<String, FreshListingState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}: Diffing trading symbol set (previous={}, current={})",
+        format_timestamp_short(Local::now()),
+        known_trading_symbols.len(),
+        current_trading_symbols.len()
+    );
+
+    let mut new_symbols = Vec::new();
     for symbol in current_trading_symbols {
         if known_trading_symbols.contains(symbol) {
             continue;
         }
 
+        new_symbols.push(symbol.clone());
         println!(
             "{}: Detected new Binance listing {}",
             format_timestamp_short(Local::now()),
@@ -335,6 +350,20 @@ fn register_new_listings(
         );
         send_listing_alert(client, config, symbol)?;
         fresh_listings.insert(symbol.clone(), FreshListingState::new());
+    }
+
+    if new_symbols.is_empty() {
+        println!(
+            "{}: Listing diff found no new symbols",
+            format_timestamp_short(Local::now())
+        );
+    } else {
+        println!(
+            "{}: Listing diff found {} new symbol(s): {}",
+            format_timestamp_short(Local::now()),
+            new_symbols.len(),
+            new_symbols.join(", ")
+        );
     }
 
     known_trading_symbols.clear();
@@ -539,6 +568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while Instant::now() < refresh_at {
             if Instant::now() >= next_listing_poll_at {
+                println!(
+                    "{}: Polling exchangeInfo for new listings",
+                    format_timestamp_short(Local::now())
+                );
                 let trading_symbols = fetch_trading_usdt_symbols(&client)?;
                 register_new_listings(
                     &client,
