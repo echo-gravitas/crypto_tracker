@@ -7,7 +7,6 @@ pub struct Config {
     pub change_threshold_pct: f64,
     pub candle_interval: String,
     pub streak_len: usize,
-    pub close_delay_secs: u64,
     pub min_quote_volume_24h: f64,
     pub telegram_token: String,
     pub telegram_chat_id: String,
@@ -20,7 +19,6 @@ impl Default for Config {
             change_threshold_pct: 0.5,
             candle_interval: "1m".to_string(),
             streak_len: 5,
-            close_delay_secs: 0,
             min_quote_volume_24h: 100_000_000.0,
             telegram_token: String::new(),
             telegram_chat_id: String::new(),
@@ -65,10 +63,6 @@ pub fn parse_config() -> Result<(Config, bool), Box<dyn std::error::Error>> {
                 let value = args.next().ok_or("missing value for --streak-len")?;
                 config.streak_len = value.parse()?;
             }
-            "--close-delay-secs" => {
-                let value = args.next().ok_or("missing value for --close-delay-secs")?;
-                config.close_delay_secs = value.parse()?;
-            }
             "--min-quote-volume-24h" => {
                 let value = args
                     .next()
@@ -88,10 +82,10 @@ pub fn parse_config() -> Result<(Config, bool), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: crypto_tracker [--interval-secs N] [--change-pct P] [--candle-interval I] [--streak-len N] [--close-delay-secs N] [--min-quote-volume-24h V] [--telegram-token T] [--telegram-chat-id ID] [--save-config]"
+                    "Usage: crypto_tracker [--interval-secs N] [--change-pct P] [--candle-interval I] [--streak-len N] [--min-quote-volume-24h V] [--telegram-token T] [--telegram-chat-id ID] [--save-config]"
                 );
                 println!(
-                    "Defaults: --interval-secs 60, --change-pct 0.5, --candle-interval 1m, --streak-len 5, --close-delay-secs 0, --min-quote-volume-24h 100000000"
+                    "Defaults: --interval-secs 60, --change-pct 0.5, --candle-interval 1m, --streak-len 5, --min-quote-volume-24h 100000000"
                 );
                 println!("Telegram: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID or pass flags.");
                 println!("Config: saved/loaded from ~/.crypto_tracker/config.json");
