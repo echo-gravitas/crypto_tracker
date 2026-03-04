@@ -38,15 +38,14 @@ fn candle_interval_secs(interval: &str) -> Result<u64, Box<dyn std::error::Error
 
 fn log_config(config: &config::Config, source: &str) {
     println!(
-        "{}: Loaded config from {} -> min_quote_volume_24h={}, interval_secs={}, change_threshold_pct={}, candle_interval={}, streak_len={}, close_delay_secs={}",
+        "{}: Loaded config from {} -> min_quote_volume_24h={}, interval_secs={}, change_threshold_pct={}, candle_interval={}, streak_len={}",
         format_timestamp_short(Local::now()),
         source,
         config.min_quote_volume_24h,
         config.interval_secs,
         config.change_threshold_pct,
         config.candle_interval,
-        config.streak_len,
-        config.close_delay_secs
+        config.streak_len
     );
 }
 
@@ -154,6 +153,43 @@ fn find_matching_window(closes: &VecDeque<f64>, streak_len: usize, threshold: f6
     None
 }
 
+fn send_momentum_alert(
+    client: &reqwest::blocking::Client,
+    config: &config::Config,
+    symbol: &str,
+    change_parts: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_ts = format_timestamp_de(Local::now());
+    let base = symbol.strip_suffix("USDT").unwrap_or(symbol);
+    let trade_url = format!("https://www.binance.com/de/trade/{}_USDT", base);
+    let pair = format!("{}/USDT", base);
+    let changes = change_parts.join(" > ");
+    let config_info = format!(
+        "Refresh: {}s\nThreshold: {:.2}%\nCandle Length: {}",
+        config.interval_secs, config.change_threshold_pct, config.candle_interval
+    );
+    let message = format!(
+        "{}\n\n*{}*\n{}\n\n{}\n{}",
+        escape_markdown_v2(&request_ts),
+        escape_markdown_v2(&pair),
+        escape_markdown_v2(&changes),
+        escape_markdown_v2(&config_info),
+        escape_markdown_v2(&trade_url)
+    );
+    send_telegram_message(
+        client,
+        &config.telegram_token,
+        &config.telegram_chat_id,
+        &message,
+    )?;
+    println!(
+        "{}: Telegram message sent for {}",
+        format_timestamp_short(Local::now()),
+        symbol
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut config, save_config) = parse_config()?;
     log_config(&config, "startup");
@@ -162,6 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Saved config to {}", path.display());
     }
     let client = reqwest::blocking::Client::new();
+    let mut alert_active_by_symbol: HashMap<String, bool> = HashMap::new();
 
     loop {
         if let Ok(Some(updated)) = try_reload_config() {
@@ -192,6 +229,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.candle_interval.as_str(),
             required_closed_klines,
         )?;
+        for symbol in &symbols {
+            let is_match = closes_by_symbol
+                .get(symbol)
+                .and_then(|closes| {
+                    find_matching_window(closes, config.streak_len, config.change_threshold_pct)
+                });
+            let was_active = alert_active_by_symbol.get(symbol).copied().unwrap_or(false);
+
+            match is_match {
+                Some(change_parts) => {
+                    if !was_active {
+                        println!(
+                            "{}: {} matched immediately after seeding",
+                            format_timestamp_short(Local::now()),
+                            symbol
+                        );
+                        send_momentum_alert(&client, &config, symbol, &change_parts)?;
+                    }
+                    alert_active_by_symbol.insert(symbol.clone(), true);
+                }
+                None => {
+                    alert_active_by_symbol.insert(symbol.clone(), false);
+                }
+            }
+        }
+        alert_active_by_symbol.retain(|symbol, _| symbols.contains(symbol));
         let mut sockets = Vec::new();
         for batch in symbols.chunks(WS_BATCH_SIZE) {
             let mut socket = connect_kline_stream(batch, config.candle_interval.as_str())?;
@@ -280,37 +343,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                if let Some(change_parts) =
-                    find_matching_window(closes, config.streak_len, config.change_threshold_pct)
-                {
-                    let request_ts = format_timestamp_de(Local::now());
-                    let base = symbol.strip_suffix("USDT").unwrap_or(&symbol);
-                    let trade_url = format!("https://www.binance.com/de/trade/{}_USDT", base);
-                    let pair = format!("{}/USDT", base);
-                    let changes = change_parts.join(" > ");
-                    let config_info = format!(
-                        "Refresh: {}s\nThreshold: {:.2}%\nCandle Length: {}",
-                        config.interval_secs, config.change_threshold_pct, config.candle_interval
-                    );
-                    let message = format!(
-                        "{}\n\n*{}*\n{}\n\n{}\n{}",
-                        escape_markdown_v2(&request_ts),
-                        escape_markdown_v2(&pair),
-                        escape_markdown_v2(&changes),
-                        escape_markdown_v2(&config_info),
-                        escape_markdown_v2(&trade_url)
-                    );
-                    send_telegram_message(
-                        &client,
-                        &config.telegram_token,
-                        &config.telegram_chat_id,
-                        &message,
-                    )?;
-                    println!(
-                        "{}: Telegram message sent for {}",
-                        format_timestamp_short(Local::now()),
-                        symbol
-                    );
+                let is_match =
+                    find_matching_window(closes, config.streak_len, config.change_threshold_pct);
+                let was_active = alert_active_by_symbol.get(&symbol).copied().unwrap_or(false);
+                match is_match {
+                    Some(change_parts) => {
+                        if !was_active {
+                            send_momentum_alert(&client, &config, &symbol, &change_parts)?;
+                        }
+                        alert_active_by_symbol.insert(symbol, true);
+                    }
+                    None => {
+                        alert_active_by_symbol.insert(symbol, false);
+                    }
                 }
             }
         }
