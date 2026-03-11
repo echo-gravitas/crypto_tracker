@@ -8,8 +8,8 @@ use binance::{
     fetch_klines, fetch_quote_volumes_24h, set_socket_read_timeout,
 };
 use chrono::Local;
-use config::{parse_config, save_config_file, try_reload_config};
-use std::collections::{HashMap, VecDeque};
+use config::{Config, parse_config, save_config_file, try_reload_config};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use telegram::{escape_markdown_v2, send_telegram_message};
@@ -17,6 +17,27 @@ use time_utils::{format_timestamp_de, format_timestamp_short};
 use tungstenite::Message;
 
 const WS_BATCH_SIZE: usize = 100;
+
+struct SymbolUniverse {
+    trading_usdt_symbols: Vec<String>,
+    tracked_symbols: Vec<String>,
+}
+
+struct FreshListingState {
+    detected_at: Instant,
+    last_candle_count: usize,
+    momentum_alert_active: bool,
+}
+
+impl FreshListingState {
+    fn new() -> Self {
+        Self {
+            detected_at: Instant::now(),
+            last_candle_count: 0,
+            momentum_alert_active: false,
+        }
+    }
+}
 
 fn candle_interval_secs(interval: &str) -> Result<u64, Box<dyn std::error::Error>> {
     if interval.len() < 2 {
@@ -36,39 +57,102 @@ fn candle_interval_secs(interval: &str) -> Result<u64, Box<dyn std::error::Error
     Ok(seconds)
 }
 
-fn log_config(config: &config::Config, source: &str) {
+fn log_config(config: &Config, source: &str) {
     println!(
-        "{}: Loaded config from {} -> min_quote_volume_24h={}, interval_secs={}, change_threshold_pct={}, candle_interval={}, streak_len={}",
+        "{}: Loaded config from {} -> min_quote_volume_24h={}, interval_secs={}, change_threshold_pct={}, candle_interval={}, streak_len={}, listing_poll_secs={}, fresh_listing_candle_interval={}, fresh_listing_ttl_mins={}",
         format_timestamp_short(Local::now()),
         source,
         config.min_quote_volume_24h,
         config.interval_secs,
         config.change_threshold_pct,
         config.candle_interval,
-        config.streak_len
+        config.streak_len,
+        config.listing_poll_secs,
+        config.fresh_listing_candle_interval,
+        config.fresh_listing_ttl_mins
     );
 }
 
-fn load_symbols(
+fn fetch_trading_usdt_symbols(
     client: &reqwest::blocking::Client,
-    min_quote_volume_24h: f64,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let info = fetch_exchange_info(client)?;
-    let volumes = fetch_quote_volumes_24h(client)?;
-
     let mut tradable: Vec<&SymbolInfo> = info
         .symbols
         .iter()
         .filter(|symbol| symbol.status == "TRADING" && symbol.quote_asset == "USDT")
-        .filter(|symbol| {
-            volumes
-                .get(&symbol.symbol)
-                .is_some_and(|v| *v >= min_quote_volume_24h)
-        })
         .collect();
 
     tradable.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-    Ok(tradable.into_iter().map(|s| s.symbol.clone()).collect())
+    let symbols: Vec<String> = tradable.into_iter().map(|s| s.symbol.clone()).collect();
+    println!(
+        "{}: Fetched {} TRADING USDT symbols from exchangeInfo",
+        format_timestamp_short(Local::now()),
+        symbols.len()
+    );
+    Ok(symbols)
+}
+
+fn load_symbol_universe(
+    client: &reqwest::blocking::Client,
+    min_quote_volume_24h: f64,
+) -> Result<SymbolUniverse, Box<dyn std::error::Error>> {
+    let trading_usdt_symbols = fetch_trading_usdt_symbols(client)?;
+    let volumes = fetch_quote_volumes_24h(client)?;
+    let mut tracked_symbols: Vec<String> = trading_usdt_symbols
+        .iter()
+        .filter(|symbol| {
+            volumes
+                .get(symbol.as_str())
+                .is_some_and(|volume| *volume >= min_quote_volume_24h)
+        })
+        .cloned()
+        .collect();
+    tracked_symbols.sort();
+
+    Ok(SymbolUniverse {
+        trading_usdt_symbols,
+        tracked_symbols,
+    })
+}
+
+fn extract_closed_closes(
+    klines: Vec<Vec<serde_json::Value>>,
+    max_closed_klines: usize,
+) -> VecDeque<f64> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_millis() as i64;
+    let mut closes = VecDeque::with_capacity(max_closed_klines);
+
+    for kline in klines {
+        let close_time_ms = match kline.get(6) {
+            Some(serde_json::Value::Number(value)) => value.as_i64(),
+            _ => None,
+        };
+        let Some(close_time_ms) = close_time_ms else {
+            continue;
+        };
+        if close_time_ms > now_ms {
+            continue;
+        }
+
+        let close = match kline.get(4).and_then(|value| value.as_str()) {
+            Some(value) => value.parse::<f64>().ok(),
+            None => None,
+        };
+        let Some(close) = close else {
+            continue;
+        };
+
+        if closes.len() == max_closed_klines {
+            closes.pop_front();
+        }
+        closes.push_back(close);
+    }
+
+    closes
 }
 
 fn seed_closes(
@@ -82,36 +166,7 @@ fn seed_closes(
     for symbol in symbols {
         let limit = required_closed_klines + 1;
         let klines = fetch_klines(client, symbol, candle_interval, limit)?;
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_millis() as i64;
-        let mut closes = VecDeque::with_capacity(required_closed_klines);
-
-        for kline in klines {
-            let close_time_ms = match kline.get(6) {
-                Some(serde_json::Value::Number(value)) => value.as_i64(),
-                _ => None,
-            };
-            let Some(close_time_ms) = close_time_ms else {
-                continue;
-            };
-            if close_time_ms > now_ms {
-                continue;
-            }
-            let close = match kline.get(4).and_then(|value| value.as_str()) {
-                Some(value) => value.parse::<f64>().ok(),
-                None => None,
-            };
-            let Some(close) = close else {
-                continue;
-            };
-            if closes.len() == required_closed_klines {
-                closes.pop_front();
-            }
-            closes.push_back(close);
-        }
-
+        let closes = extract_closed_closes(klines, required_closed_klines);
         println!(
             "{}: Seeded {} closed klines for {}",
             format_timestamp_short(Local::now()),
@@ -124,7 +179,11 @@ fn seed_closes(
     Ok(state)
 }
 
-fn find_matching_window(closes: &VecDeque<f64>, streak_len: usize, threshold: f64) -> Option<Vec<String>> {
+fn find_matching_window(
+    closes: &VecDeque<f64>,
+    streak_len: usize,
+    threshold: f64,
+) -> Option<Vec<String>> {
     let values: Vec<f64> = closes.iter().copied().collect();
     for change_window in values.windows(streak_len + 1) {
         let mut change_parts: Vec<String> = Vec::with_capacity(streak_len);
@@ -155,7 +214,7 @@ fn find_matching_window(closes: &VecDeque<f64>, streak_len: usize, threshold: f6
 
 fn send_momentum_alert(
     client: &reqwest::blocking::Client,
-    config: &config::Config,
+    config: &Config,
     symbol: &str,
     change_parts: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -183,58 +242,288 @@ fn send_momentum_alert(
         &message,
     )?;
     println!(
-        "{}: Telegram message sent for {}",
+        "{}: Telegram momentum message sent for {}",
         format_timestamp_short(Local::now()),
         symbol
     );
     Ok(())
 }
 
+fn send_listing_alert(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    symbol: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_ts = format_timestamp_de(Local::now());
+    let base = symbol.strip_suffix("USDT").unwrap_or(symbol);
+    let trade_url = format!("https://www.binance.com/de/trade/{}_USDT", base);
+    let pair = format!("{}/USDT", base);
+    let listing_info = format!(
+        "Fresh Listing\nPoll: {}s\nFresh Candle Length: {}\nFresh TTL: {}m",
+        config.listing_poll_secs,
+        config.fresh_listing_candle_interval,
+        config.fresh_listing_ttl_mins
+    );
+    let message = format!(
+        "{}\n\n*Neues Binance Listing erkannt*\n{}\n\n{}\n{}",
+        escape_markdown_v2(&request_ts),
+        escape_markdown_v2(&pair),
+        escape_markdown_v2(&listing_info),
+        escape_markdown_v2(&trade_url)
+    );
+    send_telegram_message(
+        client,
+        &config.telegram_token,
+        &config.telegram_chat_id,
+        &message,
+    )?;
+    println!(
+        "{}: Telegram listing message sent for {}",
+        format_timestamp_short(Local::now()),
+        symbol
+    );
+    Ok(())
+}
+
+fn send_fresh_listing_momentum_alert(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    symbol: &str,
+    change_parts: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_ts = format_timestamp_de(Local::now());
+    let base = symbol.strip_suffix("USDT").unwrap_or(symbol);
+    let trade_url = format!("https://www.binance.com/de/trade/{}_USDT", base);
+    let pair = format!("{}/USDT", base);
+    let changes = change_parts.join(" > ");
+    let config_info = format!(
+        "Fresh Listing Momentum\nPoll: {}s\nThreshold: {:.2}%\nCandle Length: {}",
+        config.listing_poll_secs, config.change_threshold_pct, config.fresh_listing_candle_interval
+    );
+    let message = format!(
+        "{}\n\n*{}*\n{}\n\n{}\n{}",
+        escape_markdown_v2(&request_ts),
+        escape_markdown_v2(&pair),
+        escape_markdown_v2(&changes),
+        escape_markdown_v2(&config_info),
+        escape_markdown_v2(&trade_url)
+    );
+    send_telegram_message(
+        client,
+        &config.telegram_token,
+        &config.telegram_chat_id,
+        &message,
+    )?;
+    println!(
+        "{}: Telegram fresh listing momentum message sent for {}",
+        format_timestamp_short(Local::now()),
+        symbol
+    );
+    Ok(())
+}
+
+fn register_new_listings(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    current_trading_symbols: &[String],
+    known_trading_symbols: &mut HashSet<String>,
+    fresh_listings: &mut HashMap<String, FreshListingState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}: Diffing trading symbol set (previous={}, current={})",
+        format_timestamp_short(Local::now()),
+        known_trading_symbols.len(),
+        current_trading_symbols.len()
+    );
+
+    let mut new_symbols = Vec::new();
+    for symbol in current_trading_symbols {
+        if known_trading_symbols.contains(symbol) {
+            continue;
+        }
+
+        new_symbols.push(symbol.clone());
+        println!(
+            "{}: Detected new Binance listing {}",
+            format_timestamp_short(Local::now()),
+            symbol
+        );
+        send_listing_alert(client, config, symbol)?;
+        fresh_listings.insert(symbol.clone(), FreshListingState::new());
+    }
+
+    if new_symbols.is_empty() {
+        println!(
+            "{}: Listing diff found no new symbols",
+            format_timestamp_short(Local::now())
+        );
+    } else {
+        println!(
+            "{}: Listing diff found {} new symbol(s): {}",
+            format_timestamp_short(Local::now()),
+            new_symbols.len(),
+            new_symbols.join(", ")
+        );
+    }
+
+    known_trading_symbols.clear();
+    known_trading_symbols.extend(current_trading_symbols.iter().cloned());
+    Ok(())
+}
+
+fn prune_finished_fresh_listings(
+    config: &Config,
+    fresh_listings: &mut HashMap<String, FreshListingState>,
+    known_trading_symbols: &HashSet<String>,
+) {
+    let max_age = Duration::from_secs(config.fresh_listing_ttl_mins.saturating_mul(60));
+    fresh_listings.retain(|symbol, state| {
+        let still_trading = known_trading_symbols.contains(symbol);
+        let within_ttl = max_age.is_zero() || state.detected_at.elapsed() < max_age;
+        let keep = still_trading && within_ttl;
+
+        if !keep {
+            println!(
+                "{}: Removing {} from fresh listing tracking (still_trading={}, age_secs={}, closed_candles={})",
+                format_timestamp_short(Local::now()),
+                symbol,
+                still_trading,
+                state.detected_at.elapsed().as_secs(),
+                state.last_candle_count
+            );
+        }
+
+        keep
+    });
+}
+
+fn refresh_fresh_listing_states(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    fresh_listings: &mut HashMap<String, FreshListingState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let required_closed_klines = config.streak_len.saturating_add(1);
+
+    let tracked_symbols: Vec<String> = fresh_listings.keys().cloned().collect();
+    for symbol in tracked_symbols {
+        let Some(state) = fresh_listings.get_mut(&symbol) else {
+            continue;
+        };
+
+        let klines = fetch_klines(
+            client,
+            &symbol,
+            config.fresh_listing_candle_interval.as_str(),
+            required_closed_klines + 1,
+        )?;
+        let closes = extract_closed_closes(klines, required_closed_klines);
+        if closes.len() != state.last_candle_count {
+            println!(
+                "{}: {} fresh listing candles updated from {} to {}",
+                format_timestamp_short(Local::now()),
+                symbol,
+                state.last_candle_count,
+                closes.len()
+            );
+            state.last_candle_count = closes.len();
+        }
+
+        let is_match =
+            find_matching_window(&closes, config.streak_len, config.change_threshold_pct);
+        match is_match {
+            Some(change_parts) => {
+                if !state.momentum_alert_active {
+                    send_fresh_listing_momentum_alert(client, config, &symbol, &change_parts)?;
+                }
+                state.momentum_alert_active = true;
+            }
+            None => {
+                state.momentum_alert_active = false;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.streak_len == 0 {
+        return Err("--streak-len must be at least 1".into());
+    }
+    candle_interval_secs(&config.candle_interval)?;
+    candle_interval_secs(&config.fresh_listing_candle_interval)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut config, save_config) = parse_config()?;
+    validate_config(&config)?;
     log_config(&config, "startup");
     if save_config {
         let path = save_config_file(&config)?;
         println!("Saved config to {}", path.display());
     }
+
     let client = reqwest::blocking::Client::new();
     let mut alert_active_by_symbol: HashMap<String, bool> = HashMap::new();
+    let mut known_trading_symbols: HashSet<String> = HashSet::new();
+    let mut fresh_listings: HashMap<String, FreshListingState> = HashMap::new();
 
     loop {
         if let Ok(Some(updated)) = try_reload_config() {
+            validate_config(&updated)?;
             config = updated;
             log_config(&config, "reload");
         }
-        println!("{}: Refreshing symbol universe", format_timestamp_short(Local::now()));
-        let symbols = load_symbols(&client, config.min_quote_volume_24h)?;
+
+        println!(
+            "{}: Refreshing symbol universe",
+            format_timestamp_short(Local::now())
+        );
+        let universe = load_symbol_universe(&client, config.min_quote_volume_24h)?;
+        if known_trading_symbols.is_empty() {
+            known_trading_symbols.extend(universe.trading_usdt_symbols.iter().cloned());
+            println!(
+                "{}: Initialized trading symbol baseline with {} symbols",
+                format_timestamp_short(Local::now()),
+                known_trading_symbols.len()
+            );
+        } else {
+            register_new_listings(
+                &client,
+                &config,
+                &universe.trading_usdt_symbols,
+                &mut known_trading_symbols,
+                &mut fresh_listings,
+            )?;
+        }
+
         println!(
             "{}: Pairs above {} 24h quote volume: {}",
             format_timestamp_short(Local::now()),
             config.min_quote_volume_24h,
-            symbols.len()
+            universe.tracked_symbols.len()
         );
-        if symbols.is_empty() {
-            return Err("no USDT trading symbols found".into());
-        }
-        if config.streak_len == 0 {
-            return Err("--streak-len must be at least 1".into());
+        if universe.tracked_symbols.is_empty() {
+            return Err("no USDT trading symbols found above the configured 24h volume".into());
         }
 
+        let tracked_symbol_set: HashSet<String> =
+            universe.tracked_symbols.iter().cloned().collect();
         let candle_secs = candle_interval_secs(&config.candle_interval)?;
         let lookback_candles = config.interval_secs.div_ceil(candle_secs) as usize;
         let required_closed_klines = lookback_candles.max(config.streak_len) + 1;
         let mut closes_by_symbol = seed_closes(
             &client,
-            &symbols,
+            &universe.tracked_symbols,
             config.candle_interval.as_str(),
             required_closed_klines,
         )?;
-        for symbol in &symbols {
-            let is_match = closes_by_symbol
-                .get(symbol)
-                .and_then(|closes| {
-                    find_matching_window(closes, config.streak_len, config.change_threshold_pct)
-                });
+
+        for symbol in &universe.tracked_symbols {
+            let is_match = closes_by_symbol.get(symbol).and_then(|closes| {
+                find_matching_window(closes, config.streak_len, config.change_threshold_pct)
+            });
             let was_active = alert_active_by_symbol.get(symbol).copied().unwrap_or(false);
 
             match is_match {
@@ -254,9 +543,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        alert_active_by_symbol.retain(|symbol, _| symbols.contains(symbol));
+        alert_active_by_symbol.retain(|symbol, _| tracked_symbol_set.contains(symbol));
+
         let mut sockets = Vec::new();
-        for batch in symbols.chunks(WS_BATCH_SIZE) {
+        for batch in universe.tracked_symbols.chunks(WS_BATCH_SIZE) {
             let mut socket = connect_kline_stream(batch, config.candle_interval.as_str())?;
             set_socket_read_timeout(&mut socket, Duration::from_millis(250))?;
             println!(
@@ -267,15 +557,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sockets.push(socket);
         }
         let refresh_at = Instant::now() + Duration::from_secs(config.interval_secs.max(1));
+        let mut next_listing_poll_at = Instant::now();
 
         println!(
             "{}: WebSocket connected for {} symbols across {} batches",
             format_timestamp_short(Local::now()),
-            symbols.len(),
+            universe.tracked_symbols.len(),
             sockets.len()
         );
 
         while Instant::now() < refresh_at {
+            if Instant::now() >= next_listing_poll_at {
+                println!(
+                    "{}: Polling exchangeInfo for new listings",
+                    format_timestamp_short(Local::now())
+                );
+                let trading_symbols = fetch_trading_usdt_symbols(&client)?;
+                register_new_listings(
+                    &client,
+                    &config,
+                    &trading_symbols,
+                    &mut known_trading_symbols,
+                    &mut fresh_listings,
+                )?;
+                refresh_fresh_listing_states(&client, &config, &mut fresh_listings)?;
+                prune_finished_fresh_listings(&config, &mut fresh_listings, &known_trading_symbols);
+                next_listing_poll_at =
+                    Instant::now() + Duration::from_secs(config.listing_poll_secs.max(1));
+            }
+
             for socket in &mut sockets {
                 let message = match socket.read() {
                     Ok(message) => message,
@@ -345,7 +655,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let is_match =
                     find_matching_window(closes, config.streak_len, config.change_threshold_pct);
-                let was_active = alert_active_by_symbol.get(&symbol).copied().unwrap_or(false);
+                let was_active = alert_active_by_symbol
+                    .get(&symbol)
+                    .copied()
+                    .unwrap_or(false);
                 match is_match {
                     Some(change_parts) => {
                         if !was_active {
