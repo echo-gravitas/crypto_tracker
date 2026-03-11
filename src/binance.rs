@@ -25,9 +25,7 @@ struct Ticker24h {
     quote_volume: String,
 }
 
-pub fn fetch_exchange_info(
-    client: &Client,
-) -> Result<ExchangeInfo, Box<dyn std::error::Error>> {
+pub fn fetch_exchange_info(client: &Client) -> Result<ExchangeInfo, Box<dyn std::error::Error>> {
     let exchange_info_url = "https://api.binance.com/api/v3/exchangeInfo";
     let response = client.get(exchange_info_url).send()?.error_for_status()?;
     let info: ExchangeInfo = response.json()?;
