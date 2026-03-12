@@ -59,11 +59,12 @@ fn candle_interval_secs(interval: &str) -> Result<u64, Box<dyn std::error::Error
 
 fn log_config(config: &Config, source: &str) {
     println!(
-        "{}: Loaded config from {} -> min_quote_volume_24h={}, interval_secs={}, change_threshold_pct={}, candle_interval={}, streak_len={}, listing_poll_secs={}, fresh_listing_candle_interval={}, fresh_listing_ttl_mins={}",
+        "{}: Loaded config from {} -> min_quote_volume_24h={}, interval_secs={}, lookback_candles={}, change_threshold_pct={}, candle_interval={}, streak_len={}, listing_poll_secs={}, fresh_listing_candle_interval={}, fresh_listing_ttl_mins={}",
         format_timestamp_short(Local::now()),
         source,
         config.min_quote_volume_24h,
         config.interval_secs,
+        config.lookback_candles,
         config.change_threshold_pct,
         config.candle_interval,
         config.streak_len,
@@ -224,8 +225,8 @@ fn send_momentum_alert(
     let pair = format!("{}/USDT", base);
     let changes = change_parts.join(" > ");
     let config_info = format!(
-        "Refresh: {}s\nThreshold: {:.2}%\nCandle Length: {}",
-        config.interval_secs, config.change_threshold_pct, config.candle_interval
+        "Refresh: {}s\nLookback: {} candles\nThreshold: {:.2}%\nCandle Length: {}",
+        config.interval_secs, config.lookback_candles, config.change_threshold_pct, config.candle_interval
     );
     let message = format!(
         "{}\n\n*{}*\n{}\n\n{}\n{}",
@@ -450,6 +451,9 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.streak_len == 0 {
         return Err("--streak-len must be at least 1".into());
     }
+    if config.lookback_candles < config.streak_len {
+        return Err("--lookback-candles must be greater than or equal to --streak-len".into());
+    }
     candle_interval_secs(&config.candle_interval)?;
     candle_interval_secs(&config.fresh_listing_candle_interval)?;
     Ok(())
@@ -510,9 +514,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let tracked_symbol_set: HashSet<String> =
             universe.tracked_symbols.iter().cloned().collect();
-        let candle_secs = candle_interval_secs(&config.candle_interval)?;
-        let lookback_candles = config.interval_secs.div_ceil(candle_secs) as usize;
-        let required_closed_klines = lookback_candles.max(config.streak_len) + 1;
+        let required_closed_klines = config.lookback_candles + 1;
         let mut closes_by_symbol = seed_closes(
             &client,
             &universe.tracked_symbols,

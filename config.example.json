@@ -1,5 +1,6 @@
 {
   "interval_secs": 60,
+  "lookback_candles": 5,
   "change_threshold_pct": 0.5,
   "candle_interval": "1m",
   "streak_len": 5,
